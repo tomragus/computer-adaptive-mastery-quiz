@@ -98,6 +98,18 @@ Data collection pipelines to improve difficulty estimation models
 
 Teacher dashboards for group-level insights and intervention planning
 
+### Edit 2/1/2026:
+#### Added ascendquiz_db.py
+Sample code that uses SQLite to create profile option for users
+- No pdf parsing, uses pre-loaded questions
+- Need to figure out how to integrate pdf parsing from original source code
+
+#### What's new:
+- User authentication — Create account, log back in to see progress
+- Topic tagging — Each question is tagged with a topic (e.g., "Cell Biology", "Algorithms"), enabling per-topic performance tracking
+- Dashboard — View quizzes taken, average score, and potential weaker topics
+- Quiz history — Review all past quiz attempts with scores and mastery status
+
 References
 
 Kulik, C., Kulik, J., & Bangert-Drowns, R. (1990). Effectiveness of Mastery Learning Programs: A Meta-Analysis. Review of Educational Research.
