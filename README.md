@@ -100,6 +100,7 @@ Teacher dashboards for group-level insights and intervention planning
 
 ### Edit 2/1/2026:
 #### Added ascendquiz_db.py
+Run using `streamlit run ascendquiz_db.py`
 Sample code that uses SQLite to create profile option for users
 - No pdf parsing, uses pre-loaded questions
 - Need to figure out how to integrate pdf parsing from original source code
