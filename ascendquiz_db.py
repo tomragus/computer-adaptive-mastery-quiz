@@ -2,7 +2,16 @@ import streamlit as st
 import sqlite3
 import json
 import random
+import re
+import requests
 from datetime import datetime
+
+import fitz  # PyMuPDF
+from fpdf import FPDF
+
+# Gemini API Configuration
+API_KEY = st.secrets["GEMINI_API_KEY"]
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
 
 # ============== DATABASE SETUP (all in one file) ==============
 
@@ -116,33 +125,41 @@ def update_topic_stats(user_id, topic, correct):
     conn.close()
 
 def get_user_history(user_id):
+    """Get quiz history excluding demo quizzes."""
     conn = get_connection()
     c = conn.cursor()
     c.execute('''SELECT id, pdf_name, final_score, total_questions_answered, mastery_achieved, created_at
-                 FROM quiz_sessions WHERE user_id = ? ORDER BY created_at DESC''', (user_id,))
+                 FROM quiz_sessions
+                 WHERE user_id = ? AND pdf_name != 'Demo Quiz'
+                 ORDER BY created_at DESC''', (user_id,))
     sessions = [dict(row) for row in c.fetchall()]
     conn.close()
     return sessions
 
 def get_user_stats(user_id):
+    """Get user statistics excluding demo quizzes."""
     conn = get_connection()
     c = conn.cursor()
-    
-    c.execute('''SELECT 
+
+    # Exclude demo quizzes from stats
+    c.execute('''SELECT
                     COUNT(*) as total_quizzes,
                     AVG(final_score) as avg_score,
                     SUM(CASE WHEN mastery_achieved THEN 1 ELSE 0 END) as mastery_count,
                     SUM(total_questions_answered) as total_questions
-                 FROM quiz_sessions WHERE user_id = ?''', (user_id,))
+                 FROM quiz_sessions
+                 WHERE user_id = ? AND pdf_name != 'Demo Quiz' ''', (user_id,))
     overall = dict(c.fetchone())
-    
+
     c.execute('''SELECT topic, attempts, correct,
                     ROUND(correct * 100.0 / attempts, 1) as accuracy
                  FROM topic_stats WHERE user_id = ? ORDER BY attempts DESC''', (user_id,))
     topics = [dict(row) for row in c.fetchall()]
-    
-    c.execute('''SELECT final_score, created_at FROM quiz_sessions 
-                 WHERE user_id = ? ORDER BY created_at DESC LIMIT 5''', (user_id,))
+
+    # Exclude demo quizzes from recent performance
+    c.execute('''SELECT final_score, created_at FROM quiz_sessions
+                 WHERE user_id = ? AND pdf_name != 'Demo Quiz'
+                 ORDER BY created_at DESC LIMIT 5''', (user_id,))
     recent = [dict(row) for row in c.fetchall()]
     
     conn.close()
@@ -163,6 +180,462 @@ def get_weak_topics(user_id, threshold=60):
 
 # Initialize DB
 init_db()
+
+# ============== PDF PROCESSING ==============
+
+def extract_text_from_pdf(pdf_file):
+    """Extract text from each page of a PDF file."""
+    doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
+    return [page.get_text() for page in doc if page.get_text().strip()]
+
+def get_chunks_by_token(pages):
+    """
+    Chunks the extracted PDF text based on a 10,000 token limit per chunk.
+    - If total tokens <= 10k, it returns one chunk.
+    - If total tokens <= 20k, it returns two chunks.
+    - If total tokens > 20k, it randomly selects two chunks.
+    """
+    full_text = "\n\n".join(pages)
+    TOKEN_CHUNK_SIZE = 10000 * 4  # ~40,000 characters per chunk (1 token ≈ 4 chars)
+
+    all_text_chunks = [full_text[i:i + TOKEN_CHUNK_SIZE] for i in range(0, len(full_text), TOKEN_CHUNK_SIZE)]
+    num_chunks = len(all_text_chunks)
+
+    if num_chunks <= 2:
+        return all_text_chunks
+    else:
+        return random.sample(all_text_chunks, 2)
+
+# ============== QUESTION GENERATION ==============
+
+def generate_prompt(text_chunk):
+    """Generate the detailed pedagogical prompt for Gemini to create quiz questions."""
+    return f"""
+You are a teacher who is designing a test with multiple choice questions (each with 4 answer choices) to test content from a passage.
+Given the following passage or notes, generate exactly 20 multiple choice questions that test comprehension and critical thinking. The questions must vary in difficulty. If there is not enough content to write 20 good questions, repeat or expand the material, or create additional plausible questions that still test content that is similar to what is in the passage.
+**CRITICAL REQUIREMENT - NO TEXT REFERENCES:**
+- Questions must be COMPLETELY SELF-CONTAINED and not reference the original text
+- DO NOT use phrases like "according to the passage," "the text states," "the first example," "as mentioned," "the author discusses," etc.
+- DO NOT reference specific figures, tables, pages, or sections from the passage
+- Present all necessary context within the question itself
+- Students should be able to answer based on their understanding of the concepts, not memory of where things appeared in the text
+- Frame questions as direct concept tests, not reading comprehension
+- If there is information about ISBN or ebook distribution consequences or copyrights, do not ask questions about these things. Only ask questions about academic content
+**CRITICAL: Design Questions That Test TRUE MASTERY, Not Test-Taking Skills**
+Your goal is to create questions where students CANNOT get the correct answer through:
+- Process of elimination with obviously implausible answers
+- Common sense reasoning without domain-specific knowledge
+- Guessing based on option patterns, lengths, or complexity differences
+- Recognizing what "sounds right" based on everyday language
+- Using the question wording itself as a hint to the answer
+- For questions above the remember difficulty band, questions that a student who memorizes information in the reading without true understanding can answer correctly
+Generate exactly 20 questions that vary across difficulty levels. Questions should test **conceptual understanding and application**, not just recall of text. Use the uploaded material to determine:
+1. What concepts are explicitly stated and factual: these support easy or "Remember" questions.
+2. What concepts require connecting multiple ideas or interpreting examples: these support medium or **Understand** or **Apply** questions.
+3. What concepts require analysis of interactions, synthesis, or predicting outcomes based on material in the text → these support medium/hard and hard or **Analyze**, **Evaluate**, or **Create** questions.
+Use the passage to determine which concepts can be recalled, applied, analyzed, or synthesized. Do not assign difficulty randomly.
+**For EVERY question, ensure:**
+1. **All four options are plausible to someone WITHOUT domain expertise**
+   - Wrong answers should represent actual misconceptions or partial understanding
+   - Avoid absurd options that anyone could eliminate (e.g., if asking about a biological process, don't include "it turns purple" as an option)
+   - All options should be similar in length, specificity, and technical complexity
+   - Don't mix highly technical language in one option with casual language in others
+2. **The question cannot be answered through linguistic/semantic clues alone**
+   - Don't ask "What does [term] do?" when the term's name in everyday English reveals the answer
+   - Avoid questions where the correct answer repeats key words from the question
+   - Don't make the correct answer significantly more detailed/specific than wrong answers
+   - Ensure wrong answers use equally precise terminology
+3. **Wrong answers reflect genuine confusion, not nonsense**
+   - Each wrong answer should be what a student might choose if they:
+     * Confused two related concepts
+     * Applied a rule from a different context
+     * Made a common calculation error
+     * Remembered only part of the concept
+   - Never include options that are absurd or completely unrelated to the topic
+**Difficulty Calibration Guidelines:**
+When estimating "estimated_correct_pct", consider that students may have:
+- General intelligence and test-taking skills
+- Ability to eliminate absurd options
+- Common sense reasoning
+- Pattern recognition abilities
+**Your difficulty estimates should reflect:**
+85–100% correct (Very Easy / Direct Recall)
+Students can answer by recalling a fact, definition, or formula explicitly stated in the passage.
+Requires no calculation, inference, or application beyond what is written.
+All four options must be plausible and technically correct; distractors should reflect common small misconceptions.
+70–84% correct (Easy / Understanding / Single-Step Reasoning)
+Requires one step of reasoning or minor inference beyond direct recall.
+Students must connect a concept in the passage to a similar context or slightly different phrasing, but it is still straightforward.
+Wrong answers should reflect adjacent or related concepts that a partial understanding might confuse.
+50–69% correct (Medium / Application / Multi-Step Reasoning)
+Requires applying principles from the passage to a new scenario or combining multiple pieces of information.
+The passage does not explicitly solve this problem, so students must adapt knowledge.
+Distractors should be plausible errors that someone might make if they misapplied formulas, misremembered conditions, or partially understood the concept.
+30–49% correct (Hard / Analysis / Synthesis)
+Requires deep understanding, integration, or analysis of multiple concepts in the passage.
+Students must infer relationships, compare methods, or predict outcomes not directly explained.
+Wrong answers should seem correct to someone with partial understanding, exploiting subtle distinctions or counterintuitive results.
+Below 30% correct (Very Hard / Evaluation or Creation)
+Requires expert-level judgment, design, or synthesis, combining multiple principles in novel ways.
+Multiple answers might seem defensible; students must evaluate, critique, or generate solutions based on passage principles.
+Distractors reflect plausible alternative interpretations, partial understanding, or common advanced mistakes.
+**Requirements**:
+- 5 easy (≥85%), 5 medium (60–84%), 5 medium-hard (40-60%), 5 hard (<40%)
+**Each question must include the following fields:**
+- "question": A clear, concise, and unambiguous question that tests understanding of concepts from the passage. The question should be COMPLETELY SELF-CONTAINED with all necessary context included. Never reference "the passage," "the text," specific examples by position (first, second, etc.), or figures/tables. Ask about the concept directly.
+- "options": An array of exactly 4 strings in this exact format:
+    [
+      "A. [First option text]",
+      "B. [Second option text]",
+      "C. [Third option text]",
+      "D. [Fourth option text]"
+    ]
+  Each string must start with the letter and period. Do not use an object/dictionary structure. It is 4 plausible answer choices labeled "A", "B", "C", and "D" (with one being correct). ALL four options must be similar in:
+    * Length (within 20% of each other)
+    * Specificity and detail level
+    * Technical complexity
+    * Grammatical structure
+  Wrong answers must represent genuine misconceptions from the domain, not random nonsense.
+- "correct_answer": The letter ("A", "B", "C", or "D") corresponding to the correct option.
+- "explanation": A deep, pedagogically useful explanation that teaches the concept behind the correct answer. The explanation must:
+    1. Start by stating the correct letter and full answer
+    2. Explain WHY that answer is correct using conceptual reasoning - explain mechanisms, properties, or principles
+    3. For each incorrect answer, explain:
+       - Why it's wrong
+       - What specific misconception or error would lead someone to choose it
+       - What partial understanding might make it seem correct
+    4. Focus on teaching the underlying concept, not referencing where information appeared in the text
+    5. Use the tone of a tutor helping a student understand the concept
+- "cognitive_level": Choose from "Remember", "Understand", "Apply", "Analyze", "Evaluate", or "Create" based on the cognitive skill actually tested.
+- "estimated_correct_pct": Numeric estimate of percentage of students expected to answer correctly (0-100).
+  **CRITICAL**: If your estimate is below 70%, you MUST verify:
+  - All four options are genuinely plausible to a non-expert
+  - No options can be eliminated through pure logic/common sense
+  - The question cannot be answered by someone clever who lacks domain knowledge
+  - Wrong answers represent actual conceptual confusions, not absurdities
+  If you cannot verify all of these, INCREASE the percentage estimate.
+- "reasoning": Brief rationale for the percentage assignment. **If estimated_correct_pct < 70%**, you MUST explain:
+  1. What specific domain knowledge is required that common sense/logic cannot provide
+  2. Why each wrong answer would seem plausible to someone with partial understanding
+  3. What makes this question resistant to test-taking strategies
+  If you cannot provide specific explanations for all three points, your difficulty estimate is too low.
+All math expressions must use valid LaTeX format with $...$ for inline math and $$...$$ for display math.
+Before finalizing each question, verify that the correct answer and every explanation are explicitly supported by factual information or definitions present in the passage. Please make sure that every correct answer is clearly correct and every incorrect answer is clearly incorrect.
+Focus on testing conceptual understanding rather than text memorization.
+If the passage contains code, mathematical derivations, or data tables, generate questions about:
+- How the logic/process works (not "what does line 5 do")
+- What results mean and why (not "what is the output")
+- When to apply methods (not "what is this method called")
+- Why approaches differ (not "which method is shown")
+Return **only** a valid JSON array of 20 questions. Focus on testing conceptual understanding rather than text memorization.
+Do not include any text, commentary, or markdown fences.
+Output must begin with `[` and end with `]` — no explanations outside JSON.
+Passage:
+{text_chunk}
+"""
+
+def call_gemini_api(prompt):
+    """Call the Gemini API with the given prompt."""
+    headers = {"Content-Type": "application/json"}
+    data = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 13000
+        }
+    }
+    url = f"{GEMINI_URL}?key={API_KEY}"
+    response = requests.post(url, headers=headers, json=data)
+    if response.status_code != 200:
+        return None, response.text
+    response_json = response.json()
+    try:
+        return response_json["candidates"][0]["content"]["parts"][0]["text"], None
+    except (KeyError, IndexError) as e:
+        return None, f"Failed to parse Gemini API response: {str(e)}"
+
+def clean_response_text(text: str) -> str:
+    """Extract JSON from model response, stripping markdown fences and commentary."""
+    text = text.strip()
+    fence_patterns = [
+        r"```json\s*(.*?)```",
+        r"```\s*(.*?)```",
+        r"`{3,}\s*json\s*(.*?)`{3,}",
+        r"`{3,}\s*(.*?)`{3,}"
+    ]
+
+    for pattern in fence_patterns:
+        fence_match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+        if fence_match:
+            text = fence_match.group(1).strip()
+            break
+
+    # Find JSON array boundaries
+    start_idx = text.find('[')
+    end_idx = text.rfind(']')
+
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        return text[start_idx:end_idx + 1].strip()
+
+    # Fallback: object boundaries
+    start_idx = text.find('{')
+    end_idx = text.rfind('}')
+
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        return text[start_idx:end_idx + 1].strip()
+
+    return text
+
+def repair_json(text: str) -> str:
+    """Repair malformed or truncated JSON from model output."""
+    text = re.sub(r'```(?:json)?', '', text)
+    text = text.replace('```', '').strip()
+
+    start = text.find('[')
+    end = text.rfind(']')
+    if start != -1 and end != -1:
+        text = text[start:end + 1]
+    else:
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1:
+            text = f"[{text[start:end + 1]}]"
+
+    # Fix incomplete trailing objects
+    open_braces = text.count('{')
+    close_braces = text.count('}')
+    if close_braces < open_braces:
+        last_full = text.rfind('}')
+        if last_full != -1:
+            text = text[:last_full + 1]
+        text += "]" if not text.endswith(']') else ""
+
+    text = re.sub(r'}\s*{', '}, {', text)
+    text = re.sub(r',\s*([\]}])', r'\1', text)
+
+    if not text.startswith('['):
+        text = '[' + text
+    if not text.endswith(']'):
+        text = text + ']'
+
+    return text.strip()
+
+def parse_question_json(text: str):
+    """Parse JSON with multiple fallback strategies."""
+    cleaned = clean_response_text(text)
+    cleaned = repair_json(cleaned)
+
+    # Try standard JSON parsing
+    try:
+        result = json.loads(cleaned)
+        return result
+    except json.JSONDecodeError as e:
+        # Try json5 as fallback
+        try:
+            import json5
+            result = json5.loads(cleaned)
+            return result
+        except Exception as e2:
+            # Final fallback: extract individual questions manually
+            try:
+                questions = []
+                question_pattern = r'\{\s*"question":[^}]*?"reasoning":[^}]*?\}'
+                potential_questions = re.findall(question_pattern, cleaned, re.DOTALL)
+
+                for q_text in potential_questions:
+                    try:
+                        q_obj = json.loads(q_text)
+                        questions.append(q_obj)
+                    except:
+                        continue
+
+                if questions:
+                    return questions
+            except:
+                pass
+
+            return []
+
+def filter_invalid_difficulty_alignment(questions):
+    """Filter questions where cognitive level doesn't align with estimated difficulty."""
+    bloom_difficulty_ranges = {
+        "Remember": (80, 100),
+        "Understand": (50, 90),
+        "Apply": (45, 80),
+        "Analyze": (25, 65),
+        "Evaluate": (0, 60),
+        "Create": (0, 50)
+    }
+    valid = []
+    invalid = []
+    for q in questions:
+        if not isinstance(q, dict):
+            invalid.append(q)
+            continue
+        cog = str(q.get("cognitive_level", "")).strip().capitalize()
+        try:
+            pct = int(q.get("estimated_correct_pct", -1))
+        except Exception:
+            pct = -1
+        if cog in bloom_difficulty_ranges and 0 <= pct <= 100:
+            low, high = bloom_difficulty_ranges[cog]
+            if low <= pct <= high:
+                valid.append(q)
+            else:
+                invalid.append(q)
+        else:
+            invalid.append(q)
+    return valid, invalid
+
+# ============== PERFORMANCE SUMMARY & REPORTS ==============
+
+def generate_performance_summary(answers):
+    """
+    Analyzes quiz performance data and generates a pedagogical summary using Gemini.
+    'answers' is a list of tuples: (difficulty, correctness, question_obj)
+    """
+    performance_data = []
+    for item in answers:
+        # Handle both 2-tuple and 3-tuple formats
+        if len(item) == 3:
+            diff, correct, q = item
+        else:
+            diff, correct = item
+            q = {"question": "N/A", "cognitive_level": "N/A", "explanation": "N/A"}
+
+        status = "Correct" if correct else "Incorrect"
+        q_text = q.get("question", "N/A") if isinstance(q, dict) else "N/A"
+        cog_level = q.get("cognitive_level", "N/A") if isinstance(q, dict) else "N/A"
+        explanation = q.get("explanation", "N/A")[:200] if isinstance(q, dict) else "N/A"
+
+        performance_data.append(
+            f"- Question: {q_text}\n"
+            f"  Topic/Level: {cog_level}\n"
+            f"  Result: {status}\n"
+            f"  Explanation provided: {explanation}..."
+        )
+
+    performance_string = "\n".join(performance_data)
+
+    summary_prompt = f"""
+    You are an expert educational consultant and tutor. You are reviewing a student's performance on a computer-adaptive mastery quiz.
+
+    Below is a list of questions the student answered, their cognitive level, and whether the student got them right or wrong:
+
+    {performance_string}
+
+    Based ONLY on this performance data, provide a comprehensive "Learning Progress Report" with the following sections:
+
+    1. **Overall Performance Evaluation**: A 2-3 sentence encouraging summary of their current mastery level.
+    2. **Key Strengths (Top 3)**: Identify specific concepts or cognitive skills (e.g., "Application of formulas", "Conceptual understanding of X") the student has mastered.
+    3. **Growth Areas (Top 2)**: Identify specific gaps in knowledge or reasoning where the student struggled.
+    4. **Actionable Study Plan**: Provide 3 specific, concrete steps the student should take to improve their understanding of the material.
+
+    **Tone**: Professional, encouraging, and highly specific to the content mentioned in the questions.
+    **Format**: Use Markdown for headers and bullet points.
+    """
+
+    summary_text, error = call_gemini_api(summary_prompt)
+
+    if error:
+        return f"Could not generate summary: {error}"
+    return summary_text
+
+def create_pdf_report(summary_text, mastery_score, missed_questions=None):
+    """Generate a PDF report with AI summary and missed questions review."""
+    pdf = FPDF()
+    pdf.add_page()
+
+    # Helper to clean text for PDF
+    def clean(text):
+        if text is None:
+            return ""
+        return str(text).encode('latin-1', 'ignore').decode('latin-1')
+
+    # === HEADER ===
+    pdf.set_font("helvetica", 'B', 20)
+    pdf.cell(0, 15, txt="AscendQuiz", ln=True, align='C')
+    pdf.set_font("helvetica", 'I', 12)
+    pdf.cell(0, 8, txt="Learning Progress Report", ln=True, align='C')
+    pdf.ln(5)
+
+    # === MASTERY SCORE BOX ===
+    pdf.set_fill_color(102, 126, 234)  # Purple
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("helvetica", 'B', 14)
+    pdf.cell(0, 12, txt=f"  Final Mastery Score: {mastery_score}%", ln=True, fill=True)
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(8)
+
+    # === AI SUMMARY SECTION ===
+    pdf.set_font("helvetica", 'B', 14)
+    pdf.cell(0, 10, txt="AI Performance Analysis", ln=True)
+    pdf.set_draw_color(102, 126, 234)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(5)
+
+    pdf.set_font("helvetica", size=10)
+    clean_summary = clean(summary_text)
+    pdf.multi_cell(0, 6, txt=clean_summary)
+    pdf.ln(10)
+
+    # === MISSED QUESTIONS REVIEW ===
+    if missed_questions and len(missed_questions) > 0:
+        pdf.add_page()
+        pdf.set_font("helvetica", 'B', 14)
+        pdf.cell(0, 10, txt=f"Questions to Review ({len(missed_questions)} missed)", ln=True)
+        pdf.set_draw_color(220, 53, 69)  # Red
+        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+        pdf.ln(8)
+
+        for i, (difficulty, correct, q) in enumerate(missed_questions, 1):
+            # Question number and difficulty
+            pdf.set_fill_color(248, 249, 250)
+            pdf.set_font("helvetica", 'B', 11)
+            pdf.cell(0, 8, txt=f"  Question {i} (Difficulty: {difficulty}/8)", ln=True, fill=True)
+            pdf.ln(3)
+
+            # Question text
+            pdf.set_font("helvetica", 'B', 10)
+            pdf.multi_cell(0, 6, txt=clean(q.get("question", "N/A")))
+            pdf.ln(3)
+
+            # Options
+            pdf.set_font("helvetica", size=9)
+            correct_letter = q.get("correct_answer", "").strip().upper()
+            options = q.get("options", [])
+
+            for opt in options:
+                opt_text = clean(opt)
+                # Highlight correct answer
+                if opt_text.startswith(correct_letter + ".") or opt_text.startswith(correct_letter + " "):
+                    pdf.set_text_color(40, 167, 69)  # Green
+                    pdf.multi_cell(0, 5, txt=f"  [CORRECT] {opt_text}")
+                    pdf.set_text_color(0, 0, 0)
+                else:
+                    pdf.multi_cell(0, 5, txt=f"  {opt_text}")
+
+            pdf.ln(3)
+
+            # Explanation
+            pdf.set_font("helvetica", 'I', 9)
+            pdf.set_text_color(80, 80, 80)
+            explanation = clean(q.get("explanation", "No explanation available."))
+            pdf.multi_cell(0, 5, txt=f"Explanation: {explanation}")
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(8)
+
+            # Add page break if needed
+            if pdf.get_y() > 250:
+                pdf.add_page()
+
+    # === FOOTER ===
+    pdf.set_y(-20)
+    pdf.set_font("helvetica", 'I', 8)
+    pdf.set_text_color(128, 128, 128)
+    pdf.cell(0, 10, txt="Generated by AscendQuiz - Your AI-Powered Learning Assistant", align='C')
+
+    return pdf.output()
 
 # ============== PAGE CONFIG ==============
 st.set_page_config(page_title="AscendQuiz", page_icon="📚", layout="wide")
@@ -291,23 +764,100 @@ DEMO_QUESTIONS = [
     }
 ]
 
-# ============== HELPER FUNCTIONS ==============
+# ============== ADAPTIVE QUIZ LOGIC ==============
 
 def assign_difficulty_label(estimated_pct):
-    if estimated_pct < 30: return 8
-    elif estimated_pct < 40: return 7
-    elif estimated_pct < 50: return 6
-    elif estimated_pct < 65: return 5
-    elif estimated_pct < 75: return 4
-    elif estimated_pct < 85: return 3
-    elif estimated_pct < 90: return 2
+    """Map estimated correctness percentage to difficulty tier (1-8)."""
+    try:
+        pct = int(estimated_pct)
+    except:
+        return None
+    if pct < 30: return 8
+    elif pct < 40: return 7
+    elif pct < 50: return 6
+    elif pct < 65: return 5
+    elif pct < 75: return 4
+    elif pct < 85: return 3
+    elif pct < 90: return 2
     else: return 1
 
+def group_by_difficulty(questions):
+    """Organize questions into 8 difficulty tiers."""
+    groups = {i: [] for i in range(1, 9)}
+    for q in questions:
+        pct = q.get("estimated_correct_pct", 0)
+        label = assign_difficulty_label(pct)
+        if label:
+            q["difficulty_label"] = label
+            groups[label].append(q)
+    return groups
+
+def pick_question(diff, asked, all_qs):
+    """Get available questions at a difficulty level that haven't been asked."""
+    pool = all_qs.get(diff, [])
+    return [(i, q) for i, q in enumerate(pool) if (diff, i) not in asked]
+
+def find_next_difficulty(current_diff, going_up, asked, all_qs):
+    """Find the next difficulty tier with available questions."""
+    next_diff = current_diff + 1 if going_up else current_diff - 1
+    if 1 <= next_diff <= 8 and pick_question(next_diff, asked, all_qs):
+        return next_diff
+    search_range = (
+        range(next_diff + 1, 9) if going_up else range(next_diff - 1, 0, -1)
+    )
+    for d in search_range:
+        if pick_question(d, asked, all_qs):
+            return d
+    return current_diff
+
+def get_next_question(current_diff, asked, all_qs):
+    """Select a random question from the current difficulty tier."""
+    available = pick_question(current_diff, asked, all_qs)
+    if not available:
+        return current_diff, None, None
+    idx, q = random.choice(available)
+    return current_diff, idx, q
+
+def accuracy_on_levels(answers, levels):
+    """Calculate accuracy for specific difficulty levels."""
+    filtered = [item[1] for item in answers if item[0] in levels]
+    return sum(filtered) / len(filtered) if filtered else 0
+
 def compute_mastery_score(answers):
+    """
+    Compute weighted mastery score based on difficulty bands.
+    Higher difficulty tiers are worth more points.
+    """
     if not answers:
         return 0
-    correct = sum(1 for _, c in answers if c)
-    return int((correct / len(answers)) * 100)
+
+    mastery_bands = {
+        (1, 2): 25,    # Easy questions: max 25 points
+        (3, 4): 65,    # Medium questions: max 65 points
+        (5, 6): 85,    # Medium-hard questions: max 85 points
+        (7, 8): 100    # Hard questions: max 100 points
+    }
+    min_attempts_required = 3
+    band_scores = []
+
+    for levels, weight in mastery_bands.items():
+        # Handle both 2-tuple (difficulty, correct) and 3-tuple (difficulty, correct, question) formats
+        relevant = [item[1] for item in answers if item[0] in levels]
+        attempts = len(relevant)
+        if attempts == 0:
+            continue
+        acc = sum(relevant) / attempts
+        normalized_score = max((acc - 0.25) / 0.75, 0)
+        if attempts < min_attempts_required:
+            scaled_score = normalized_score * weight * (attempts / min_attempts_required)
+            band_scores.append(scaled_score)
+        else:
+            band_score = normalized_score * weight
+            band_scores.append(band_score)
+
+    if not band_scores:
+        return 0
+    return int(round(max(band_scores)))
 
 # ============== UI COMPONENTS ==============
 
@@ -529,163 +1079,538 @@ def render_history():
 
 def render_quiz():
     st.title("📝 Take a Quiz")
-    
-    if "quiz_active" not in st.session_state:
+
+    # Loading tips to show during question generation
+    LOADING_TIPS = [
+        "💡 The quiz adapts to your level - harder questions unlock higher scores!",
+        "🎯 Mastery is achieved at 70% - answer harder questions correctly to get there faster.",
+        "📚 Questions are generated using Bloom's Taxonomy for varied cognitive levels.",
+        "⚡ The difficulty adjusts after each answer based on your performance.",
+        "🧠 Each question tests conceptual understanding, not just memorization.",
+    ]
+
+    # Handle regeneration from existing PDF
+    if st.session_state.get("regenerate_from_pdf", False) and "pdf_pages" in st.session_state:
+        st.session_state.regenerate_from_pdf = False
+        pdf_name = st.session_state.get("pdf_name", "Uploaded PDF")
+
+        tip_placeholder = st.empty()
+        progress_placeholder = st.empty()
+
+        with st.spinner(""):
+            tip_placeholder.info(f"💡 {random.choice(LOADING_TIPS)}")
+            progress_placeholder.markdown(f"**Generating new questions from {pdf_name}...**")
+
+            try:
+                pages = st.session_state.pdf_pages
+                chunks_to_use = get_chunks_by_token(pages)
+
+                all_questions = []
+                for i, chunk in enumerate(chunks_to_use):
+                    if not chunk.strip():
+                        continue
+                    tip_placeholder.info(f"💡 {random.choice(LOADING_TIPS)}")
+                    prompt = generate_prompt(chunk)
+                    response_text, error = call_gemini_api(prompt)
+                    if error:
+                        st.error(f"API error: {error}")
+                        # Clear regeneration state on error
+                        for key in ["pdf_pages", "pdf_name"]:
+                            if key in st.session_state:
+                                del st.session_state[key]
+                        st.stop()
+                    parsed = parse_question_json(response_text)
+                    valid, invalid = filter_invalid_difficulty_alignment(parsed)
+                    all_questions.extend(valid)
+
+                tip_placeholder.info(f"💡 {random.choice(LOADING_TIPS)}")
+                progress_placeholder.markdown("**Validating and organizing questions...**")
+
+                if len(all_questions) < 10:
+                    st.error(f"Only {len(all_questions)} valid questions generated. Need at least 10.")
+                    for key in ["pdf_pages", "pdf_name"]:
+                        if key in st.session_state:
+                            del st.session_state[key]
+                    st.stop()
+
+                # Set up quiz state
+                st.session_state.all_questions = all_questions
+                st.session_state.questions_by_difficulty = group_by_difficulty(all_questions)
+                st.session_state.quiz_mode = "pdf"
+                st.session_state.quiz_active = True
+                st.session_state.quiz_state = {
+                    "current_difficulty": 4,
+                    "asked": set(),
+                    "answers": [],
+                    "quiz_end": False,
+                    "current_q_idx": None,
+                    "current_q": None,
+                    "show_explanation": False,
+                    "last_correct": None,
+                }
+
+                st.session_state.current_session_id = save_quiz_session(
+                    st.session_state.user["id"],
+                    pdf_name,
+                    all_questions,
+                    0, 0, False
+                )
+
+                tip_placeholder.empty()
+                progress_placeholder.empty()
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"Error regenerating questions: {str(e)}")
+                for key in ["pdf_pages", "pdf_name"]:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.stop()
+
+    # Check if we're in quiz mode
+    if not st.session_state.get("quiz_active", False):
+        # === PDF UPLOAD (PRIMARY) ===
         st.markdown("""
-        ### Demo Mode 🎮
-        
-        This demo uses pre-loaded sample questions to show how the adaptive quiz works.
-        
-        **Topics covered:** Cell Biology, Linear Equations, Data Structures, Calculus, Algorithms, Web Development, Chemistry, Databases, Python, OOP
-        
-        *In the full version, you upload a PDF and AI generates custom questions!*
+        ### Upload Your Study Material 📄
+
+        Transform any PDF into an AI-generated adaptive quiz. The system will:
+        - Extract key concepts from your document
+        - Generate 20 questions across difficulty levels
+        - Adapt the quiz to your performance in real-time
+
+        *Processing takes 1-3 minutes depending on document length.*
         """)
-        
-        if st.button("🚀 Start Demo Quiz", use_container_width=True):
+
+        uploaded_pdf = st.file_uploader("Upload your PDF", type=["pdf"], key="pdf_uploader")
+
+        if uploaded_pdf:
+            if st.button("🚀 Generate Quiz", use_container_width=True):
+                # Show spinner with rotating tips
+                tip_placeholder = st.empty()
+                progress_placeholder = st.empty()
+
+                with st.spinner(""):
+                    tip_placeholder.info(f"💡 {random.choice(LOADING_TIPS)}")
+                    progress_placeholder.markdown("**Step 1/3:** Extracting text from PDF...")
+
+                    try:
+                        pages = extract_text_from_pdf(uploaded_pdf)
+                        st.session_state.pdf_pages = pages
+                        st.session_state.pdf_name = uploaded_pdf.name
+
+                        tip_placeholder.info(f"💡 {random.choice(LOADING_TIPS)}")
+                        progress_placeholder.markdown("**Step 2/3:** Generating questions with AI...")
+
+                        chunks_to_use = get_chunks_by_token(pages)
+
+                        all_questions = []
+                        for i, chunk in enumerate(chunks_to_use):
+                            if not chunk.strip():
+                                continue
+                            tip_placeholder.info(f"💡 {random.choice(LOADING_TIPS)}")
+                            prompt = generate_prompt(chunk)
+                            response_text, error = call_gemini_api(prompt)
+                            if error:
+                                st.error(f"API error: {error}")
+                                st.session_state.clear()
+                                st.stop()
+                            parsed = parse_question_json(response_text)
+                            valid, invalid = filter_invalid_difficulty_alignment(parsed)
+                            all_questions.extend(valid)
+
+                        tip_placeholder.info(f"💡 {random.choice(LOADING_TIPS)}")
+                        progress_placeholder.markdown("**Step 3/3:** Validating and organizing questions...")
+
+                        # Check minimum question requirement
+                        if len(all_questions) < 10:
+                            st.error(f"Only {len(all_questions)} valid questions were generated. Need at least 10. Please try a different PDF.")
+                            st.session_state.clear()
+                            st.stop()
+
+                        # Set up quiz state
+                        st.session_state.all_questions = all_questions
+                        st.session_state.questions_by_difficulty = group_by_difficulty(all_questions)
+                        st.session_state.quiz_mode = "pdf"
+                        st.session_state.quiz_active = True
+                        st.session_state.quiz_state = {
+                            "current_difficulty": 4,
+                            "asked": set(),
+                            "answers": [],
+                            "quiz_end": False,
+                            "current_q_idx": None,
+                            "current_q": None,
+                            "show_explanation": False,
+                            "last_correct": None,
+                        }
+
+                        # Save quiz session to database
+                        st.session_state.current_session_id = save_quiz_session(
+                            st.session_state.user["id"],
+                            uploaded_pdf.name,
+                            all_questions,
+                            0, 0, False
+                        )
+
+                        tip_placeholder.empty()
+                        progress_placeholder.empty()
+                        st.rerun()
+
+                    except Exception as e:
+                        st.error(f"Error processing PDF: {str(e)}")
+                        st.session_state.clear()
+                        st.stop()
+
+        # === DEMO MODE (SECONDARY) ===
+        st.markdown("---")
+        st.markdown("#### Or try a demo first")
+        st.caption("Preview how the adaptive quiz works with sample questions (no API needed).")
+
+        if st.button("🎮 Try Demo Instead", use_container_width=False):
             questions = DEMO_QUESTIONS.copy()
             random.shuffle(questions)
-            
+
+            # Group demo questions by difficulty for adaptive logic
+            questions_by_diff = group_by_difficulty(questions)
+
+            st.session_state.all_questions = questions
+            st.session_state.questions_by_difficulty = questions_by_diff
+            st.session_state.quiz_mode = "demo"
             st.session_state.quiz_active = True
-            st.session_state.quiz_questions = questions
-            st.session_state.current_q_idx = 0
-            st.session_state.answers = []
-            st.session_state.show_explanation = False
-            
-            st.session_state.current_session_id = save_quiz_session(
-                st.session_state.user["id"],
-                "Demo Quiz",
-                questions,
-                0, 0, False
-            )
+            st.session_state.quiz_state = {
+                "current_difficulty": 4,
+                "asked": set(),
+                "answers": [],
+                "quiz_end": False,
+                "current_q_idx": None,
+                "current_q": None,
+                "show_explanation": False,
+                "last_correct": None,
+            }
+            # No database session for demo mode
+            st.session_state.current_session_id = None
             st.rerun()
+
         return
-    
-    questions = st.session_state.quiz_questions
-    idx = st.session_state.current_q_idx
-    answers = st.session_state.answers
-    
-    if idx >= len(questions):
+
+    # === ACTIVE QUIZ ===
+    state = st.session_state.quiz_state
+    all_qs = st.session_state.questions_by_difficulty
+    is_pdf_mode = st.session_state.get("quiz_mode") == "pdf"
+
+    # Check if quiz ended
+    if state.get("quiz_end", False):
         render_quiz_complete()
         return
-    
-    q = questions[idx]
-    score = compute_mastery_score(answers)
-    
-    progress = (idx / len(questions))
-    st.progress(progress, text=f"Question {idx + 1} of {len(questions)}")
-    
+
+    # Get next question if needed
+    if state["current_q"] is None and not state.get("show_explanation", False):
+        diff, idx, q = get_next_question(state["current_difficulty"], state["asked"], all_qs)
+        if q is None:
+            state["quiz_end"] = True
+            st.rerun()
+        else:
+            state["current_q"] = q
+            state["current_q_idx"] = idx
+            state["current_difficulty"] = diff
+
+    # Calculate current score
+    score = compute_mastery_score(state["answers"])
+    num_answered = len(state["answers"])
+
+    # Mastery progress bar
     mastery_color = "#28a745" if score >= 70 else "#ffc107" if score >= 50 else "#dc3545"
     st.markdown(f"""
     <div style="background: #e9ecef; border-radius: 10px; height: 30px; margin: 10px 0; position: relative;">
         <div style="background: {mastery_color}; width: {score}%; height: 100%; border-radius: 10px;"></div>
-        <div style="position: absolute; top: 0; left: 0; right: 0; height: 100%; 
+        <div style="position: absolute; top: 0; left: 0; right: 0; height: 100%;
                     display: flex; align-items: center; justify-content: center; font-weight: bold;">
             Mastery: {score}%
         </div>
     </div>
     """, unsafe_allow_html=True)
-    
-    topic = q.get("topic", "General")
-    difficulty = assign_difficulty_label(q.get("estimated_correct_pct", 50))
-    
-    st.markdown(f"""
-    <div style="margin: 15px 0;">
-        <span style="background: #e3f2fd; color: #1976d2; padding: 5px 12px; border-radius: 15px; font-size: 0.9em;">
-            📚 {topic}
-        </span>
-        <span style="background: #fff3e0; color: #e65100; padding: 5px 12px; border-radius: 15px; font-size: 0.9em; margin-left: 8px;">
-            ⚡ Level {difficulty}/8
-        </span>
-    </div>
-    """, unsafe_allow_html=True)
-    
+
+    st.caption(f"Questions answered: {num_answered}")
+
+    q = state["current_q"]
+    if q is None:
+        state["quiz_end"] = True
+        st.rerun()
+        return
+
+    difficulty = state["current_difficulty"]
+
+    # Display question (don't show difficulty before answering)
     st.markdown(f"### {q['question']}")
-    
-    if not st.session_state.show_explanation:
-        selected = st.radio("Choose your answer:", q["options"], key=f"q_{idx}", index=None)
-        
+
+    if not state.get("show_explanation", False):
+        # Strip option labels for clean display
+        def strip_leading_label(text):
+            return re.sub(r"^[A-Da-d][\).:\-]?\s+", "", text).strip()
+
+        option_labels = ["A", "B", "C", "D"]
+        cleaned_options = [strip_leading_label(opt) for opt in q["options"]]
+        rendered_options = []
+        for label, text in zip(option_labels, cleaned_options):
+            if "$" in text or "\\" in text:
+                rendered_text = f"{label}. $${text}$$"
+            else:
+                rendered_text = f"{label}. {text}"
+            rendered_options.append(rendered_text)
+
+        selected = st.radio("Choose your answer:", options=rendered_options, key=f"q_{num_answered}", index=None)
+
         if st.button("Submit Answer", use_container_width=True):
             if selected is None:
                 st.warning("Please select an answer!")
             else:
-                selected_letter = selected[0]
-                correct = selected_letter == q["correct_answer"]
-                
-                st.session_state.answers.append((difficulty, correct))
-                st.session_state.last_correct = correct
-                st.session_state.show_explanation = True
-                
-                save_response(
-                    st.session_state.current_session_id,
-                    q["question"][:200],
-                    difficulty,
-                    correct,
-                    topic
-                )
-                update_topic_stats(st.session_state.user["id"], topic, correct)
-                
+                selected_letter = selected.split(".")[0].strip().upper()
+                correct_letter = q["correct_answer"].strip().upper()
+                correct = (selected_letter == correct_letter)
+
+                # Record answer
+                state["asked"].add((difficulty, state["current_q_idx"]))
+                state["answers"].append((difficulty, correct, q))
+                state["last_correct"] = correct
+                state["show_explanation"] = True
+
+                # Save response to database (PDF mode only)
+                if is_pdf_mode and st.session_state.current_session_id:
+                    save_response(
+                        st.session_state.current_session_id,
+                        q["question"][:200],
+                        difficulty,
+                        correct,
+                        q.get("cognitive_level", "General")
+                    )
+
+                # Check if mastery reached
+                new_score = compute_mastery_score(state["answers"])
+                if new_score >= 70:
+                    state["quiz_end"] = True
+
                 st.rerun()
     else:
-        if st.session_state.last_correct:
+        # Show answer feedback with difficulty revealed
+        topic_or_level = q.get("topic", q.get("cognitive_level", "General"))
+        st.markdown(f"""
+        <div style="margin: 15px 0;">
+            <span style="background: #e3f2fd; color: #1976d2; padding: 5px 12px; border-radius: 15px; font-size: 0.9em;">
+                📚 {topic_or_level}
+            </span>
+            <span style="background: #fff3e0; color: #e65100; padding: 5px 12px; border-radius: 15px; font-size: 0.9em; margin-left: 8px;">
+                ⚡ Level {difficulty}/8
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Get correct answer letter
+        correct_letter = q["correct_answer"].strip().upper()
+
+        # Simple result message
+        if state["last_correct"]:
             st.success("✅ Correct! Great job!")
         else:
-            st.error(f"❌ Incorrect. The answer was {q['correct_answer']}.")
-        
-        st.info(f"**Explanation:** {q['explanation']}")
-        
+            st.error(f"❌ Incorrect. The correct answer was {correct_letter}.")
+
+        # Simple explanation display
+        st.info(f"**Explanation:** {q.get('explanation', 'No explanation available.')}")
+
         if st.button("Next Question →", use_container_width=True):
-            st.session_state.current_q_idx += 1
-            st.session_state.show_explanation = False
+            # Adjust difficulty based on correctness
+            if state["last_correct"]:
+                state["current_difficulty"] = find_next_difficulty(
+                    state["current_difficulty"], going_up=True, asked=state["asked"], all_qs=all_qs
+                )
+            else:
+                state["current_difficulty"] = find_next_difficulty(
+                    state["current_difficulty"], going_up=False, asked=state["asked"], all_qs=all_qs
+                )
+
+            state["current_q"] = None
+            state["current_q_idx"] = None
+            state["show_explanation"] = False
+            state["last_correct"] = None
             st.rerun()
 
+
 def render_quiz_complete():
-    answers = st.session_state.answers
+    state = st.session_state.quiz_state
+    answers = state["answers"]
     score = compute_mastery_score(answers)
     total = len(answers)
-    correct = sum(1 for _, c in answers if c)
+    correct_count = sum(1 for _, c, _ in answers if c) if answers and len(answers[0]) == 3 else sum(1 for _, c in answers if c)
+    incorrect_count = total - correct_count
     mastery = score >= 70
-    
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute('''UPDATE quiz_sessions SET final_score = ?, total_questions_answered = ?, mastery_achieved = ?
-                WHERE id = ?''', (score, total, mastery, st.session_state.current_session_id))
-    conn.commit()
-    conn.close()
-    
+    is_pdf_mode = st.session_state.get("quiz_mode") == "pdf"
+
+    # Update database (PDF mode only)
+    if is_pdf_mode and st.session_state.get("current_session_id"):
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute('''UPDATE quiz_sessions SET final_score = ?, total_questions_answered = ?, mastery_achieved = ?
+                    WHERE id = ?''', (score, total, mastery, st.session_state.current_session_id))
+        conn.commit()
+        conn.close()
+
+    # Header
     st.markdown("## 🎉 Quiz Complete!")
-    
+
     if mastery:
         st.balloons()
-        st.success(f"🏆 Mastery Achieved! You scored {score}%")
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%);
+                    border: 2px solid #28a745; border-radius: 15px; padding: 20px; margin: 20px 0; text-align: center;">
+            <h2 style="color: #155724; margin: 0;">🏆 Mastery Achieved!</h2>
+            <p style="color: #155724; font-size: 1.2em; margin: 10px 0 0 0;">You've demonstrated strong understanding of the material.</p>
+        </div>
+        """, unsafe_allow_html=True)
     else:
-        st.warning(f"📖 You scored {score}%. Keep practicing to reach 70% mastery!")
-    
-    col1, col2, col3 = st.columns(3)
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #fff3cd 0%, #ffeeba 100%);
+                    border: 2px solid #ffc107; border-radius: 15px; padding: 20px; margin: 20px 0; text-align: center;">
+            <h2 style="color: #856404; margin: 0;">📖 Keep Practicing!</h2>
+            <p style="color: #856404; font-size: 1.2em; margin: 10px 0 0 0;">You're making progress. Review the material and try again.</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Results Overview with Donut Chart
+    col1, col2 = st.columns([1, 1])
+
     with col1:
-        st.metric("Final Score", f"{score}%")
+        # Metrics cards
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    border-radius: 12px; padding: 20px; margin: 10px 0; text-align: center; color: white;">
+            <div style="font-size: 2.5em; font-weight: bold;">{score}%</div>
+            <div style="font-size: 1em; opacity: 0.9;">Mastery Score</div>
+        </div>
+        """.format(score=score), unsafe_allow_html=True)
+
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+                    border-radius: 12px; padding: 20px; margin: 10px 0; text-align: center; color: white;">
+            <div style="font-size: 2.5em; font-weight: bold;">{correct}/{total}</div>
+            <div style="font-size: 1em; opacity: 0.9;">Questions Correct</div>
+        </div>
+        """.format(correct=correct_count, total=total), unsafe_allow_html=True)
+
     with col2:
-        st.metric("Correct Answers", f"{correct}/{total}")
-    with col3:
-        st.metric("Status", "Mastered ✅" if mastery else "Keep Going 📖")
-    
+        # Donut chart using SVG
+        correct_pct = (correct_count / total * 100) if total > 0 else 0
+        incorrect_pct = 100 - correct_pct
+
+        # Calculate stroke dasharray for donut chart (circumference = 2 * pi * r = 2 * 3.14159 * 40 ≈ 251.3)
+        circumference = 251.3
+        correct_dash = correct_pct / 100 * circumference
+        incorrect_dash = incorrect_pct / 100 * circumference
+
+        st.markdown(f"""
+        <div style="text-align: center; padding: 10px;">
+            <svg width="200" height="200" viewBox="0 0 100 100">
+                <!-- Background circle -->
+                <circle cx="50" cy="50" r="40" fill="none" stroke="#e9ecef" stroke-width="12"/>
+                <!-- Incorrect segment (red/gray) -->
+                <circle cx="50" cy="50" r="40" fill="none" stroke="#dc3545" stroke-width="12"
+                        stroke-dasharray="{incorrect_dash} {circumference}"
+                        stroke-dashoffset="0"
+                        transform="rotate(-90 50 50)"/>
+                <!-- Correct segment (green) -->
+                <circle cx="50" cy="50" r="40" fill="none" stroke="#28a745" stroke-width="12"
+                        stroke-dasharray="{correct_dash} {circumference}"
+                        stroke-dashoffset="-{incorrect_dash}"
+                        transform="rotate(-90 50 50)"/>
+                <!-- Center text -->
+                <text x="50" y="45" text-anchor="middle" font-size="14" font-weight="bold" fill="#333">{correct_count}/{total}</text>
+                <text x="50" y="60" text-anchor="middle" font-size="8" fill="#666">Correct</text>
+            </svg>
+            <div style="display: flex; justify-content: center; gap: 20px; margin-top: 10px;">
+                <div><span style="color: #28a745;">●</span> Correct ({correct_count})</div>
+                <div><span style="color: #dc3545;">●</span> Incorrect ({incorrect_count})</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
     st.markdown("---")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("📊 View Dashboard", use_container_width=True):
-            for key in ["quiz_active", "quiz_questions", "current_q_idx", "answers", 
-                       "show_explanation", "last_correct", "current_session_id"]:
-                if key in st.session_state:
-                    del st.session_state[key]
-            st.rerun()
-    
-    with col2:
-        if st.button("🔄 Take Another Quiz", use_container_width=True):
-            for key in ["quiz_active", "quiz_questions", "current_q_idx", "answers", 
-                       "show_explanation", "last_correct", "current_session_id"]:
-                if key in st.session_state:
-                    del st.session_state[key]
-            st.rerun()
+
+    # Check for regeneration confirmation dialog
+    if st.session_state.get("confirm_regenerate", False):
+        pdf_name = st.session_state.get("pdf_name", "your PDF")
+        st.warning(f"🔄 Generate new questions from **{pdf_name}**?")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ Yes, Generate New Questions", use_container_width=True):
+                # Keep pdf_pages but clear quiz state for regeneration
+                st.session_state.confirm_regenerate = False
+                st.session_state.regenerate_from_pdf = True
+                # Clear quiz-related state but keep PDF data
+                for key in ["quiz_active", "quiz_state", "all_questions",
+                           "questions_by_difficulty", "current_session_id", "report_text"]:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.rerun()
+        with col2:
+            if st.button("❌ Cancel", use_container_width=True):
+                st.session_state.confirm_regenerate = False
+                st.rerun()
+        return
+
+    # Action buttons
+    if is_pdf_mode:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("📊 View Dashboard", use_container_width=True):
+                _clear_quiz_state()
+                st.rerun()
+        with col2:
+            if st.button("🔄 Retry Same Questions", use_container_width=True):
+                # Reset quiz state but keep questions
+                st.session_state.quiz_state = {
+                    "current_difficulty": 4,
+                    "asked": set(),
+                    "answers": [],
+                    "quiz_end": False,
+                    "current_q_idx": None,
+                    "current_q": None,
+                    "show_explanation": False,
+                    "last_correct": None,
+                }
+                if "report_text" in st.session_state:
+                    del st.session_state["report_text"]
+                # Create new session for retry
+                st.session_state.current_session_id = save_quiz_session(
+                    st.session_state.user["id"],
+                    st.session_state.get("pdf_name", "Retry"),
+                    st.session_state.all_questions,
+                    0, 0, False
+                )
+                st.rerun()
+        with col3:
+            if st.button("📄 Generate New Questions", use_container_width=True):
+                st.session_state.confirm_regenerate = True
+                st.rerun()
+    else:
+        # Demo mode - simpler options
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📊 View Dashboard", use_container_width=True):
+                _clear_quiz_state()
+                st.rerun()
+        with col2:
+            if st.button("🔄 Take Another Quiz", use_container_width=True):
+                _clear_quiz_state()
+                st.rerun()
+
+
+def _clear_quiz_state():
+    """Helper to clear all quiz-related session state."""
+    keys_to_clear = [
+        "quiz_active", "quiz_state", "quiz_mode", "all_questions",
+        "questions_by_difficulty", "current_session_id", "pdf_pages",
+        "pdf_name", "report_text"
+    ]
+    for key in keys_to_clear:
+        if key in st.session_state:
+            del st.session_state[key]
 
 # ============== MAIN ==============
 
