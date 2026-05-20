@@ -277,6 +277,15 @@ Generate exactly {count} multiple-choice questions based on the passage below.
     {{"B": "why B is wrong...", "C": "why C is wrong...", "D": "why D is wrong..."}}
     Each value must be written directly to the student with no meta-commentary.
 - "estimated_correct_pct": Integer between {low} and {high} — MUST stay in this range
+- "feedback_correct": A short (5–12 word) congratulatory message that references the SPECIFIC
+    concept tested in the question. Do NOT use generic praise like "Great job!" or "Correct!".
+    Instead, tie it to the content — e.g. "You've got mitosis down cold!" or
+    "Exactly — supply and demand curves shift, not rotate." Be encouraging but specific.
+    Vary tone across questions: some enthusiastic, some calm, some witty.
+- "feedback_incorrect": A short (5–12 word) encouraging message that hints at the right concept
+    WITHOUT giving away the answer. Do NOT use generic phrases like "Not quite" or "Try again".
+    Instead, nudge toward the concept — e.g. "Think about what happens during the G1 phase..."
+    or "Remember: price floors create surpluses, not shortages." Be kind, not condescending.
 
 All math expressions must use valid LaTeX format ($...$ for inline, $$...$$ for display math).
 Before finalizing each question, verify the correct answer is clearly correct and each wrong answer is clearly incorrect based on the passage content.
@@ -553,9 +562,13 @@ def render_quiz():
     tier = state["current_tier"]
 
     # Progress header
+    streak_display = ""
+    current_streak = state.get("streak", 0)
+    if current_streak >= 2:
+        streak_display = f" &nbsp;|&nbsp; 🔥 {current_streak} streak"
     st.markdown(
         f"**Question {num_answered + 1} of {QUIZ_LENGTH}** &nbsp;|&nbsp; "
-        f"{num_correct} correct &nbsp;|&nbsp; Difficulty: {TIER_NAMES[tier]}"
+        f"{num_correct} correct &nbsp;|&nbsp; Difficulty: {TIER_NAMES[tier]}{streak_display}"
     )
     st.progress((num_answered) / QUIZ_LENGTH)
     st.markdown("---")
@@ -593,10 +606,121 @@ def render_quiz():
         # Feedback
         correct_letter = q["correct_answer"].strip().upper()
 
+        # --- Streak tracking ---
+        if "streak" not in state:
+            state["streak"] = 0
+            state["best_streak"] = 0
         if state["last_correct"]:
-            st.success("Correct!")
+            state["streak"] = state.get("streak", 0) + 1
+            state["best_streak"] = max(state.get("best_streak", 0), state["streak"])
         else:
-            st.error(f"Incorrect. The correct answer was **{correct_letter}**.")
+            state["streak"] = 0
+
+        streak = state["streak"]
+        best_streak = state["best_streak"]
+
+        # --- Custom feedback message ---
+        if state["last_correct"]:
+            custom_msg = q.get("feedback_correct", "").strip()
+            if not custom_msg:
+                custom_msg = "Correct!"
+
+            # Streak badge
+            streak_html = ""
+            if streak >= 3:
+                streak_html = f'<span style="margin-left:12px;font-size:0.95em;">🔥 {streak} streak!</span>'
+
+            # Confetti + success banner
+            st.markdown(f"""
+            <style>
+                @keyframes slideDown {{
+                    from {{ opacity: 0; transform: translateY(-20px); }}
+                    to {{ opacity: 1; transform: translateY(0); }}
+                }}
+                @keyframes confettiFall {{
+                    0% {{ opacity: 1; transform: translateY(0) rotate(0deg); }}
+                    100% {{ opacity: 0; transform: translateY(350px) rotate(720deg); }}
+                }}
+                .correct-banner {{
+                    background: linear-gradient(135deg, #10b981, #059669);
+                    color: white;
+                    padding: 16px 24px;
+                    border-radius: 12px;
+                    font-size: 1.15em;
+                    font-weight: 600;
+                    animation: slideDown 0.4s ease-out;
+                    margin-bottom: 16px;
+                    position: relative;
+                    overflow: hidden;
+                }}
+                .confetti-container {{
+                    position: absolute;
+                    top: 0; left: 0; right: 0; bottom: 0;
+                    pointer-events: none;
+                    overflow: hidden;
+                }}
+                .confetti {{
+                    position: absolute;
+                    top: -10px;
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 2px;
+                    animation: confettiFall 1.5s ease-in forwards;
+                }}
+            </style>
+            <div class="correct-banner">
+                <div class="confetti-container">
+                    <div class="confetti" style="left:5%;background:#fbbf24;animation-delay:0s;animation-duration:1.2s;"></div>
+                    <div class="confetti" style="left:15%;background:#f472b6;animation-delay:0.1s;animation-duration:1.4s;"></div>
+                    <div class="confetti" style="left:25%;background:#60a5fa;animation-delay:0.05s;animation-duration:1.1s;"></div>
+                    <div class="confetti" style="left:40%;background:#fbbf24;animation-delay:0.15s;animation-duration:1.3s;"></div>
+                    <div class="confetti" style="left:55%;background:#34d399;animation-delay:0.08s;animation-duration:1.5s;"></div>
+                    <div class="confetti" style="left:65%;background:#f472b6;animation-delay:0.2s;animation-duration:1.2s;"></div>
+                    <div class="confetti" style="left:75%;background:#a78bfa;animation-delay:0.12s;animation-duration:1.4s;"></div>
+                    <div class="confetti" style="left:85%;background:#60a5fa;animation-delay:0.18s;animation-duration:1.1s;"></div>
+                    <div class="confetti" style="left:92%;background:#fbbf24;animation-delay:0.07s;animation-duration:1.3s;"></div>
+                </div>
+                ✅ {custom_msg}{streak_html}
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            custom_msg = q.get("feedback_incorrect", "").strip()
+            if not custom_msg:
+                custom_msg = f"The correct answer was {correct_letter}."
+            else:
+                custom_msg = f"{custom_msg} The answer was **{correct_letter}**."
+
+            # Shake + incorrect banner
+            st.markdown(f"""
+            <style>
+                @keyframes shake {{
+                    0%, 100% {{ transform: translateX(0); }}
+                    15% {{ transform: translateX(-6px); }}
+                    30% {{ transform: translateX(5px); }}
+                    45% {{ transform: translateX(-4px); }}
+                    60% {{ transform: translateX(3px); }}
+                    75% {{ transform: translateX(-2px); }}
+                }}
+                @keyframes slideDown {{
+                    from {{ opacity: 0; transform: translateY(-20px); }}
+                    to {{ opacity: 1; transform: translateY(0); }}
+                }}
+                .incorrect-banner {{
+                    background: linear-gradient(135deg, #ef4444, #dc2626);
+                    color: white;
+                    padding: 16px 24px;
+                    border-radius: 12px;
+                    font-size: 1.15em;
+                    font-weight: 600;
+                    animation: shake 0.5s ease-out, slideDown 0.4s ease-out;
+                    margin-bottom: 16px;
+                }}
+            </style>
+            <div class="incorrect-banner">
+                ❌ {custom_msg}
+            </div>
+            """, unsafe_allow_html=True)
+
         explanation_correct = q.get("explanation_correct") or q.get("explanation", "No explanation available.")
         explanation_wrong = q.get("explanation_wrong", {})
 
@@ -647,7 +771,11 @@ def _finish_quiz():
         total,
     )
 
-    st.session_state.quiz_result = {"correct": correct, "total": total}
+    st.session_state.quiz_result = {
+        "correct": correct,
+        "total": total,
+        "best_streak": state.get("best_streak", 0),
+    }
     st.session_state.quiz_active = False
     st.session_state.quiz_done = True
     st.rerun()
@@ -658,17 +786,22 @@ def render_results():
     correct = result.get("correct", 0)
     total = result.get("total", QUIZ_LENGTH)
     pct = round(correct / total * 100) if total > 0 else 0
+    best_streak = result.get("best_streak", 0)
 
     st.title("Quiz Complete!")
     st.markdown("---")
 
     _, col2, _ = st.columns([1, 2, 1])
     with col2:
+        streak_line = ""
+        if best_streak >= 2:
+            streak_line = f'<div style="font-size: 1.1em; color: #f59e0b; margin-top: 8px;">🔥 Best streak: {best_streak}</div>'
         st.markdown(
             f"""
             <div style="text-align: center; padding: 30px 0;">
                 <div style="font-size: 4em; font-weight: bold; color: #1f77b4;">{correct}/{total}</div>
                 <div style="font-size: 1.5em; color: #666; margin-top: 8px;">{pct}% correct</div>
+                {streak_line}
             </div>
             """,
             unsafe_allow_html=True,
