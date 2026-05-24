@@ -17,8 +17,6 @@ Once your environment is set up, run using 'streamlit run ascendquiz_db_v3.py'
 - Dashboard — View quizzes taken, average score, and potential weaker topics
 - Quiz history — Review all past quiz attempts with scores and mastery status
 
-### This project is a collaboration between Ashley Zhou, Tom Ragus, Ethan Baquarian, and Timothy Chen. It is a work in progress and we are actively working to improve it.
-
 A key challenges (as of April 2026):
 - Having a determined set of quiz questions generated in the question pool at the start of the quiz (current problem: not enough questions are generated, making the quiz sometimes end early due to lack of questions, even if the user answers them correctly). IDEA: running multiple API calls in parallel across difficulty distribution (instead of calling once to generate 12-10-6-2, call twice to generate 6-5-3-1: asking for fewer question per API call should increase reliability)
 - Adding additional features, reworking the "mastery" feature, updating dashboard and history features
