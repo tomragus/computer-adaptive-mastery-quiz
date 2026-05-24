@@ -11,6 +11,8 @@ Download the streamlit library and then set up your "secrets.toml" file (in your
 
 Once your environment is set up, run using 'streamlit run ascendquiz_db_v3.py'
 
+### This project is a collaboration between myself, Adi Arora, Ashley Zhou, Timothy Chen, and Aaron Wong.
+
 #### What's new:
 - User authentication — Create account, log back in to see progress
 - Topic tagging — Each question is tagged with a topic (e.g., "Cell Biology", "Algorithms"), enabling per-topic performance tracking
